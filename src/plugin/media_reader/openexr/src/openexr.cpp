@@ -6,7 +6,12 @@
 
 #include <Iex.h>
 #include <IexErrnoExc.h>
-#ifdef __linux__
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <IlmThreadMutex.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -60,11 +65,50 @@ static Uuid s_plugin_uuid("9fd34c7e-8b35-44c7-8976-387bae1e35e0");
 // The file is memory-mapped once, then OpenEXR decompresses directly from the mapped pages.
 // The OS handles prefetching/caching at the virtual memory level, which is much faster
 // than repeated read() syscalls through OpenEXR's default StdIFStream.
-#ifdef __linux__
+// Cross-platform: uses CreateFileMapping on Windows, mmap on Linux/macOS.
 class MemoryMappedIStream : public Imf::IStream {
 public:
     MemoryMappedIStream(const char *filename)
-        : Imf::IStream(filename), fd_(-1), data_(nullptr), size_(0), pos_(0) {
+        : Imf::IStream(filename), data_(nullptr), size_(0), pos_(0)
+#ifdef _WIN32
+          , file_handle_(INVALID_HANDLE_VALUE), mapping_handle_(nullptr)
+#else
+          , fd_(-1)
+#endif
+    {
+#ifdef _WIN32
+        // Windows: CreateFileMapping / MapViewOfFile
+        file_handle_ = CreateFileA(
+            filename, GENERIC_READ, FILE_SHARE_READ, nullptr,
+            OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (file_handle_ == INVALID_HANDLE_VALUE) {
+            throw Iex::IoExc(std::string("Cannot open file: ") + filename);
+        }
+        LARGE_INTEGER file_size;
+        if (!GetFileSizeEx(file_handle_, &file_size) || file_size.QuadPart == 0) {
+            CloseHandle(file_handle_);
+            file_handle_ = INVALID_HANDLE_VALUE;
+            throw Iex::IoExc(std::string("Cannot get size or empty file: ") + filename);
+        }
+        size_ = static_cast<uint64_t>(file_size.QuadPart);
+        mapping_handle_ = CreateFileMappingA(
+            file_handle_, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        if (!mapping_handle_) {
+            CloseHandle(file_handle_);
+            file_handle_ = INVALID_HANDLE_VALUE;
+            throw Iex::IoExc(std::string("Cannot create file mapping: ") + filename);
+        }
+        data_ = static_cast<const uint8_t *>(
+            MapViewOfFile(mapping_handle_, FILE_MAP_READ, 0, 0, 0));
+        if (!data_) {
+            CloseHandle(mapping_handle_);
+            mapping_handle_ = nullptr;
+            CloseHandle(file_handle_);
+            file_handle_ = INVALID_HANDLE_VALUE;
+            throw Iex::IoExc(std::string("Cannot map view of file: ") + filename);
+        }
+#else
+        // Linux/macOS: mmap
         fd_ = ::open(filename, O_RDONLY);
         if (fd_ < 0) {
             throw Iex::IoExc(std::string("Cannot open file: ") + filename);
@@ -89,18 +133,34 @@ public:
             fd_ = -1;
             throw Iex::IoExc(std::string("Cannot mmap file: ") + filename);
         }
-        // Advise the kernel we'll read sequentially
         ::madvise(const_cast<uint8_t *>(data_), size_, MADV_SEQUENTIAL);
+#endif
     }
 
     ~MemoryMappedIStream() override {
+#ifdef _WIN32
+        if (data_) {
+            UnmapViewOfFile(data_);
+        }
+        if (mapping_handle_) {
+            CloseHandle(mapping_handle_);
+        }
+        if (file_handle_ != INVALID_HANDLE_VALUE) {
+            CloseHandle(file_handle_);
+        }
+#else
         if (data_) {
             ::munmap(const_cast<uint8_t *>(data_), size_);
         }
         if (fd_ >= 0) {
             ::close(fd_);
         }
+#endif
     }
+
+    // Prevent copying
+    MemoryMappedIStream(const MemoryMappedIStream &) = delete;
+    MemoryMappedIStream &operator=(const MemoryMappedIStream &) = delete;
 
     bool isMemoryMapped() const override { return true; }
 
@@ -127,12 +187,16 @@ public:
     void seekg(uint64_t pos) override { pos_ = pos; }
 
 private:
-    int fd_;
     const uint8_t *data_;
     uint64_t size_;
     uint64_t pos_;
+#ifdef _WIN32
+    HANDLE file_handle_;
+    HANDLE mapping_handle_;
+#else
+    int fd_;
+#endif
 };
-#endif // __linux__
 
 /* Given an image display and data window and a maximum
 overscan amount, compute the cropped data window that limits
@@ -268,13 +332,15 @@ static ui::viewport::GPUShaderPtr
 
 OpenEXRMediaReader::OpenEXRMediaReader(const utility::JsonStore &prefs)
     : MediaReader("OpenEXR", prefs) {
-    // With multiple concurrent precache workers reading EXR files in parallel,
-    // we reduce the per-read internal thread count to avoid over-subscription.
-    // Total threads = setGlobalThreadCount * concurrent_readers.
-    // Aim: ~hardware_concurrency total decode threads across all readers.
+    // OpenEXR's internal thread pool is GLOBAL - shared across ALL concurrent
+    // readPixels() calls from all workers. Each worker's calling thread also
+    // participates in decompression. So the pool should be sized to saturate
+    // all CPU cores. With N workers + pool_size threads, we want
+    // N + pool_size ~= hw_threads. Setting pool to hw_threads is fine since
+    // workers won't always be active simultaneously, and slight over-subscription
+    // is preferable to leaving cores idle during decompression.
     const unsigned int hw_threads = std::thread::hardware_concurrency();
-    const int exr_threads = std::max(2u, hw_threads / 4);
-    Imf::setGlobalThreadCount(exr_threads);
+    Imf::setGlobalThreadCount(std::max(4u, hw_threads));
     max_exr_overscan_percent_ = 5.0f;
     readers_per_source_       = 1;
 
@@ -304,16 +370,12 @@ ImageBufPtr OpenEXRMediaReader::image(const media::AVFrameID &mptr) {
 
     // DebugTimer dd(path);
 
-    // Use memory-mapped IStream on Linux for zero-copy reads.
+    // Use memory-mapped IStream for zero-copy reads (cross-platform).
     // OpenEXR decompresses directly from the mmap'd pages, eliminating
     // per-scanline read() syscalls. This is the same technique used by
     // tlRender (mrv2's rendering backend) for high-performance EXR playback.
-#ifdef __linux__
     MemoryMappedIStream mmap_stream(path.c_str());
     Imf::MultiPartInputFile input(mmap_stream);
-#else
-    Imf::MultiPartInputFile input(path.c_str());
-#endif
     int parts    = input.parts();
     int part_idx = -1;
     std::array<Imf::PixelType, 4> pix_type;
@@ -367,13 +429,11 @@ ImageBufPtr OpenEXRMediaReader::image(const media::AVFrameID &mptr) {
 
     Imf::InputPart in(input, part_idx);
 
-    utility::JsonStore part_metadata;
-    try {
-        const Imf::Header &h = in.header();
-        exr_reader::dump_json_headers(h, part_metadata.ref());
-    } catch (const std::exception &e) {
-        part_metadata["METADATA LOAD ERROR"] = e.what();
-    }
+    // Skip expensive metadata JSON conversion during image reads.
+    // dump_json_headers() does 20+ dynamic_casts per attribute across ~30 attributes,
+    // wasting CPU on RTTI. The detail() function already captures full metadata when
+    // a source is first opened, making this redundant for playback. The media_metadata
+    // plugin provides per-source metadata to the inspector/HUD separately.
 
     Imath::Box2i data_window    = in.header().dataWindow();
     Imath::Box2i display_window = in.header().displayWindow();
@@ -426,7 +486,8 @@ ImageBufPtr OpenEXRMediaReader::image(const media::AVFrameID &mptr) {
         memset(b, 0, buf_size);
     }
 
-    buf->set_metadata(part_metadata);
+    // Metadata is NOT set per-frame for performance. See detail() and the
+    // media_metadata OpenEXR plugin for metadata capture on source load.
 
     // 4th channel is always put into 'alpha' channel as per shader code
     // above
@@ -715,12 +776,8 @@ xstudio::media::MediaDetail OpenEXRMediaReader::detail(const caf::uri &uri) cons
     utility::Timecode tc("00:00:00:00");
     std::vector<media::StreamDetail> streams;
 
-#ifdef __linux__
     MemoryMappedIStream mmap_stream(path.c_str());
     Imf::MultiPartInputFile input(mmap_stream);
-#else
-    Imf::MultiPartInputFile input(path.c_str());
-#endif
     double fr = 0.0;
 
     int parts = input.parts();

@@ -149,7 +149,7 @@ ReaderHelper::ReaderHelper(
 GlobalMediaReaderActor::GlobalMediaReaderActor(
     caf::actor_config &cfg, const utility::Uuid &uuid)
     : caf::event_based_actor(cfg), uuid_(uuid), max_source_count_(256), max_source_age_(600),
-      max_in_flight_per_playhead_(16), num_precache_workers_(4) {
+      max_in_flight_per_playhead_(16), num_precache_workers_(8) {
     print_on_exit(this, "GlobalMediaReaderActor");
     spdlog::debug("Created GlobalMediaReaderActor.");
     if (uuid_.is_null())
