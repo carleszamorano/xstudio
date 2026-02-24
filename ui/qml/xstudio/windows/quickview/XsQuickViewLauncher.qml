@@ -98,7 +98,7 @@ Item {
         if (component.status == Component.Ready) {
             if (compare_mode == "Off" || compare_mode == "") {
                 for (var source in sources) {
-                    var quick_viewer = component.createObject(appWindow, {x: __position.x, y: __position.y, width: __size.width, height: __size.height});
+                    var quick_viewer = component.createObject(null, {x: __position.x, y: __position.y, width: __size.width, height: __size.height});
                     quick_viewer.show()
                     quick_viewer.viewport.view.quickViewSource([sources[source]], "Off", in_frame, out_frame)
                     quick_viewer.raise()
@@ -106,7 +106,7 @@ Item {
                     quick_viewer.raise()
                 }
             } else {
-                var quick_viewer = component.createObject(appWindow, {x: __position.x, y: __position.y, width: __size.width, height: __size.height});
+                var quick_viewer = component.createObject(null, {x: __position.x, y: __position.y, width: __size.width, height: __size.height});
                 quick_viewer.show()
                 quick_viewer.viewport.view.quickViewSource(sources, compare_mode, in_frame, out_frame)
                 quick_viewer.raise()
