@@ -18,7 +18,7 @@ namespace media_reader {
             const utility::Uuid &plugin_uuid,
             caf::actor image_cache = caf::actor(),
             caf::actor audio_cache = caf::actor(),
-            int num_precache_workers = 1);
+            int num_precache_workers = 4);
         ~CachingMediaReaderActor() override = default;
 
         caf::behavior make_behavior() override { return behavior_; }
@@ -60,7 +60,7 @@ namespace media_reader {
 
         caf::actor urgent_worker_;
         std::vector<caf::actor> precache_workers_;
-        int precache_worker_idx_ = 0;
+        size_t precache_worker_idx_ = {0};
         caf::actor audio_worker_;
 
         ImageBufPtr blank_image_;

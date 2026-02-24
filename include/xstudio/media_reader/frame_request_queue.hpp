@@ -85,6 +85,8 @@ namespace media_reader {
         /**
          *   @brief Get the next ordered frame request
          *
+         *   @param in_flight_counts Map of playhead UUIDs to their current in-flight count
+         *   @param max_in_flight Maximum number of concurrent in-flight requests per playhead
          */
         std::optional<FrameRequest>
         pop_request(const std::map<utility::Uuid, int> &in_flight_counts, int max_in_flight = 1);
