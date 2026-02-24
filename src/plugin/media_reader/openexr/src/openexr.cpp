@@ -2,17 +2,11 @@
 #include <filesystem>
 #include <algorithm>
 #include <cctype>
-#include <cstring>
-#include <vector>
-#include <fstream>
 
 #include <Iex.h>
 #include <IexErrnoExc.h>
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
+#ifdef __linux__
+#include <IlmThreadMutex.h>
 #endif
 #include <Imath/ImathBox.h>
 #include <ImfInputFile.h>
@@ -25,14 +19,12 @@
 #include <ImfTimeCodeAttribute.h>
 #include <ImfIntAttribute.h>
 #include <ImfVecAttribute.h>
-#include <ImfIO.h>
 
 #include "xstudio/media/media_error.hpp"
 #include "xstudio/media_reader/media_reader.hpp"
 #include "xstudio/utility/helpers.hpp"
 #include "xstudio/utility/logging.hpp"
 #include <chrono>
-#include <thread>
 #include "xstudio/ui/opengl/shader_program_base.hpp"
 
 #include "openexr.hpp"
@@ -55,115 +47,6 @@ namespace exr_reader {
 
 namespace {
 static Uuid s_plugin_uuid("9fd34c7e-8b35-44c7-8976-387bae1e35e0");
-
-// Bulk-read IStream for OpenEXR — reads the entire file into a contiguous
-// RAM buffer with a single I/O call, then exposes it as a "memory-mapped"
-// stream to OpenEXR.  This is the same strategy used by tlRender (mrv2's
-// rendering backend) via ftk::FileIO / ftk::MemFile.
-//
-// Why not OS-level mmap (CreateFileMapping / mmap)?
-//   • Over network storage (SMB/CIFS/NFS), mmap turns every OpenEXR read
-//     into an on-demand page fault that round-trips to the file server.
-//     Hundreds of small random reads at decompression time become hundreds
-//     of network round-trips.
-//   • A single bulk read lets the OS (and NIC) stream the bytes in one shot,
-//     saturating network bandwidth instead of latency-bound faulting.
-//   • On local SSD the difference is negligible; on a network share it is
-//     the difference between 8 s (mrv2) and 24 s (previous xStudio).
-//
-// On Windows we use the Win32 API (CreateFile + ReadFile) with
-// FILE_FLAG_SEQUENTIAL_SCAN for maximum read-ahead.  On other platforms
-// we use POSIX open/read which is equally efficient.
-class BulkReadIStream : public Imf::IStream {
-public:
-    explicit BulkReadIStream(const char *filename)
-        : Imf::IStream(filename), pos_(0)
-    {
-#ifdef _WIN32
-        HANDLE fh = CreateFileA(
-            filename,
-            GENERIC_READ,
-            FILE_SHARE_READ,
-            nullptr,
-            OPEN_EXISTING,
-            FILE_FLAG_SEQUENTIAL_SCAN,
-            nullptr);
-        if (fh == INVALID_HANDLE_VALUE) {
-            throw Iex::IoExc(std::string("Cannot open file: ") + filename);
-        }
-        LARGE_INTEGER li;
-        if (!GetFileSizeEx(fh, &li) || li.QuadPart == 0) {
-            CloseHandle(fh);
-            throw Iex::IoExc(std::string("Cannot get size or empty file: ") + filename);
-        }
-        buf_.resize(static_cast<size_t>(li.QuadPart));
-
-        // Read the whole file in one (or a few) kernel call(s).
-        size_t total_read = 0;
-        while (total_read < buf_.size()) {
-            DWORD to_read = static_cast<DWORD>(
-                std::min<size_t>(buf_.size() - total_read, 0x7FFF0000u)); // ~2 GB max per call
-            DWORD actually_read = 0;
-            if (!ReadFile(fh, buf_.data() + total_read, to_read, &actually_read, nullptr) ||
-                actually_read == 0) {
-                CloseHandle(fh);
-                throw Iex::IoExc(std::string("Read error: ") + filename);
-            }
-            total_read += actually_read;
-        }
-        CloseHandle(fh);
-#else
-        // POSIX path
-        std::ifstream ifs(filename, std::ios::binary | std::ios::ate);
-        if (!ifs) {
-            throw Iex::IoExc(std::string("Cannot open file: ") + filename);
-        }
-        auto sz = ifs.tellg();
-        if (sz <= 0) {
-            throw Iex::IoExc(std::string("Empty or unreadable file: ") + filename);
-        }
-        buf_.resize(static_cast<size_t>(sz));
-        ifs.seekg(0);
-        ifs.read(reinterpret_cast<char *>(buf_.data()), sz);
-        if (!ifs) {
-            throw Iex::IoExc(std::string("Read error: ") + filename);
-        }
-#endif
-    }
-
-    // Prevent copying
-    BulkReadIStream(const BulkReadIStream &) = delete;
-    BulkReadIStream &operator=(const BulkReadIStream &) = delete;
-
-    // Tell OpenEXR this stream supports memory-mapped reads so it can
-    // decompress directly from our buffer without an extra memcpy.
-    bool isMemoryMapped() const override { return true; }
-
-    char *readMemoryMapped(int n) override {
-        if (pos_ + n > buf_.size()) {
-            throw Iex::IoExc("Read past end of file buffer");
-        }
-        char *out = reinterpret_cast<char *>(buf_.data() + pos_);
-        pos_ += n;
-        return out;
-    }
-
-    bool read(char c[], int n) override {
-        if (pos_ + n > buf_.size()) {
-            throw Iex::IoExc("Read past end of file buffer");
-        }
-        std::memcpy(c, buf_.data() + pos_, n);
-        pos_ += n;
-        return pos_ < buf_.size();
-    }
-
-    uint64_t tellg() override { return pos_; }
-    void seekg(uint64_t pos) override { pos_ = pos; }
-
-private:
-    std::vector<uint8_t> buf_;
-    uint64_t pos_;
-};
 
 /* Given an image display and data window and a maximum
 overscan amount, compute the cropped data window that limits
@@ -299,15 +182,7 @@ static ui::viewport::GPUShaderPtr
 
 OpenEXRMediaReader::OpenEXRMediaReader(const utility::JsonStore &prefs)
     : MediaReader("OpenEXR", prefs) {
-    // OpenEXR's internal thread pool is GLOBAL - shared across ALL concurrent
-    // readPixels() calls from all workers. Each worker's calling thread also
-    // participates in decompression. So the pool should be sized to saturate
-    // all CPU cores. With N workers + pool_size threads, we want
-    // N + pool_size ~= hw_threads. Setting pool to hw_threads is fine since
-    // workers won't always be active simultaneously, and slight over-subscription
-    // is preferable to leaving cores idle during decompression.
-    const unsigned int hw_threads = std::thread::hardware_concurrency();
-    Imf::setGlobalThreadCount(std::max(4u, hw_threads));
+    Imf::setGlobalThreadCount(16);
     max_exr_overscan_percent_ = 5.0f;
     readers_per_source_       = 1;
 
@@ -337,11 +212,7 @@ ImageBufPtr OpenEXRMediaReader::image(const media::AVFrameID &mptr) {
 
     // DebugTimer dd(path);
 
-    // Bulk-read the entire file into RAM, then let OpenEXR decompress
-    // from that buffer. This is critical for network storage where mmap
-    // would cause per-page network round-trips.
-    BulkReadIStream bulk_stream(path.c_str());
-    Imf::MultiPartInputFile input(bulk_stream);
+    Imf::MultiPartInputFile input(path.c_str());
     int parts    = input.parts();
     int part_idx = -1;
     std::array<Imf::PixelType, 4> pix_type;
@@ -395,11 +266,13 @@ ImageBufPtr OpenEXRMediaReader::image(const media::AVFrameID &mptr) {
 
     Imf::InputPart in(input, part_idx);
 
-    // Skip expensive metadata JSON conversion during image reads.
-    // dump_json_headers() does 20+ dynamic_casts per attribute across ~30 attributes,
-    // wasting CPU on RTTI. The detail() function already captures full metadata when
-    // a source is first opened, making this redundant for playback. The media_metadata
-    // plugin provides per-source metadata to the inspector/HUD separately.
+    utility::JsonStore part_metadata;
+    try {
+        const Imf::Header &h = in.header();
+        exr_reader::dump_json_headers(h, part_metadata.ref());
+    } catch (const std::exception &e) {
+        part_metadata["METADATA LOAD ERROR"] = e.what();
+    }
 
     Imath::Box2i data_window    = in.header().dataWindow();
     Imath::Box2i display_window = in.header().displayWindow();
@@ -452,8 +325,7 @@ ImageBufPtr OpenEXRMediaReader::image(const media::AVFrameID &mptr) {
         memset(b, 0, buf_size);
     }
 
-    // Metadata is NOT set per-frame for performance. See detail() and the
-    // media_metadata OpenEXR plugin for metadata capture on source load.
+    buf->set_metadata(part_metadata);
 
     // 4th channel is always put into 'alpha' channel as per shader code
     // above
@@ -742,8 +614,7 @@ xstudio::media::MediaDetail OpenEXRMediaReader::detail(const caf::uri &uri) cons
     utility::Timecode tc("00:00:00:00");
     std::vector<media::StreamDetail> streams;
 
-    BulkReadIStream bulk_stream(path.c_str());
-    Imf::MultiPartInputFile input(bulk_stream);
+    Imf::MultiPartInputFile input(path.c_str());
     double fr = 0.0;
 
     int parts = input.parts();

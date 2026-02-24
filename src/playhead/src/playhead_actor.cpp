@@ -1092,7 +1092,7 @@ void PlayheadActor::init() {
                 anon_mail(precache_atom_v).send(hero_sub_playhead_.actor());
                 if (audio_playhead_)
                     anon_mail(precache_atom_v).send(audio_playhead_);
-                anon_mail(precache_atom_v).delay(std::chrono::milliseconds(50)).send(this);
+                anon_mail(precache_atom_v).delay(std::chrono::milliseconds(500)).send(this);
             } else if (sub_playheads_.size()) {
                 sub_playhead_precache_idx_ =
                     (sub_playhead_precache_idx_ + 1) % sub_playheads_.size();
@@ -1104,7 +1104,7 @@ void PlayheadActor::init() {
                 }
                 if (playing()) {
                     anon_mail(precache_atom_v)
-                        .delay(std::chrono::milliseconds(50 / sub_playheads_.size()))
+                        .delay(std::chrono::milliseconds(500 / sub_playheads_.size()))
                         .send(this);
                 }
             }

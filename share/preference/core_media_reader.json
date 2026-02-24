@@ -48,30 +48,6 @@
 				"datatype": "int",
 				"context": ["APPLICATION"]
 			},
-			"max_in_flight_per_playhead": {
-				"path": "/core/media_reader/max_in_flight_per_playhead",
-				"default_value": 16,
-				"description": "Maximum number of concurrent precache read requests per playhead. Higher values improve EXR sequence read-ahead throughput by allowing parallel IO and decode, similar to tlRender/mrv2 which defaults to 16. Set to 1 for legacy sequential behavior.",
-				"value": 16,
-				"minimum": 1,
-				"maximum": 64,
-				"datatype": "int",
-				"context": ["APPLICATION"],
-				"category": "Playback",
-				"display_name": "Precache concurrency per playhead"
-			},
-			"precache_workers_per_source": {
-				"path": "/core/media_reader/precache_workers_per_source",
-				"default_value": 8,
-				"description": "Number of parallel precache decode workers per media source. Each worker can decode a different frame simultaneously. OpenEXR's global thread pool is shared across all workers, so more workers means more frames being decompressed in parallel.",
-				"value": 8,
-				"minimum": 1,
-				"maximum": 32,
-				"datatype": "int",
-				"context": ["APPLICATION"],
-				"category": "Playback",
-				"display_name": "Precache workers per source"
-			},
 			"auto_gather_sources": {
 				"path": "/core/media_reader/auto_gather_sources",
 				"default_value": false,

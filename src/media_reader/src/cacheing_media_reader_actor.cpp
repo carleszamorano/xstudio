@@ -86,14 +86,13 @@ CachingMediaReaderActor::CachingMediaReaderActor(
     caf::actor_config &cfg,
     const utility::Uuid &media_reader_plugin_uuid,
     caf::actor image_cache,
-    caf::actor audio_cache,
-    int num_precache_workers)
+    caf::actor audio_cache)
     : caf::event_based_actor(cfg),
       image_cache_(std::move(image_cache)),
       audio_cache_(std::move(audio_cache)) {
 
     print_on_exit(this, "CachingMediaReaderActor");
-    spdlog::debug("Created CachingMediaReaderActor with {} precache workers.", num_precache_workers);
+    spdlog::debug("Created CachingMediaReaderActor.");
 
     // create plugins..
     {
@@ -104,13 +103,9 @@ CachingMediaReaderActor::CachingMediaReaderActor(
         auto pm = system().registry().template get<caf::actor>(plugin_manager_registry);
         scoped_actor sys{system()};
 
-        // Create N precache workers for parallel read-ahead (like OpenRV/mrv2)
-        for (int i = 0; i < num_precache_workers; ++i) {
-            auto worker = request_receive<caf::actor>(
-                *sys, pm, plugin_manager::spawn_plugin_atom_v, media_reader_plugin_uuid, js);
-            link_to(worker);
-            precache_workers_.push_back(worker);
-        }
+        precache_worker_ = request_receive<caf::actor>(
+            *sys, pm, plugin_manager::spawn_plugin_atom_v, media_reader_plugin_uuid, js);
+        link_to(precache_worker_);
         urgent_worker_ = request_receive<caf::actor>(
             *sys, pm, plugin_manager::spawn_plugin_atom_v, media_reader_plugin_uuid, js);
         link_to(urgent_worker_);
@@ -245,21 +240,31 @@ CachingMediaReaderActor::CachingMediaReaderActor(
             return receive_image_buffer_request(mptr, playhead_uuid);
         },
 
-        [=](read_precache_image_atom, const media::AVFrameID &mptr) {
-            // Delegate directly to worker, bypassing this actor on the
-            // response path. The worker's response goes straight to the
-            // caller (GlobalMediaReaderActor), eliminating 2 message hops
-            // (request+response through this intermediary).
-            auto &worker = precache_workers_[precache_worker_idx_ % precache_workers_.size()];
-            precache_worker_idx_++;
-            return mail(get_image_atom_v, mptr).delegate(worker);
+        [=](read_precache_image_atom, const media::AVFrameID &mptr) -> result<ImageBufPtr> {
+            // note the caller (GlobalMediaReaderActor) handles the cacheing
+            // of this image buffer
+            auto rp = make_response_promise<media_reader::ImageBufPtr>();
+            mail(get_image_atom_v, mptr)
+                .request(precache_worker_, infinite)
+                .then(
+                    [=](media_reader::ImageBufPtr buf) mutable { rp.deliver(buf); },
+                    [=](const caf::error &err) mutable {
+                        rp.deliver(make_error_buffer(err, mptr));
+                    });
+
+            return rp;
         },
 
-        [=](read_precache_audio_atom, const media::AVFrameID &mptr) {
-            // Same delegate optimization for audio precache reads.
-            auto &worker = precache_workers_[precache_worker_idx_ % precache_workers_.size()];
-            precache_worker_idx_++;
-            return mail(get_audio_atom_v, mptr).delegate(worker);
+        [=](read_precache_audio_atom, const media::AVFrameID &mptr) -> result<AudioBufPtr> {
+            // note the caller (GlobalMediaReaderActor) handles the cacheing
+            // of this image buffer
+            auto rp = make_response_promise<media_reader::AudioBufPtr>();
+            mail(get_audio_atom_v, mptr)
+                .request(precache_worker_, infinite)
+                .then(
+                    [=](media_reader::AudioBufPtr buf) mutable { rp.deliver(buf); },
+                    [=](const caf::error &err) mutable { rp.deliver(err); });
+            return rp;
         },
 
         [=](get_media_detail_atom atom, const caf::uri &_uri) {
