@@ -92,6 +92,8 @@ namespace media_reader {
 
         size_t max_source_count_;
         size_t max_source_age_;
+        int max_in_flight_per_playhead_;
+        int num_precache_workers_;
 
         FrameRequestQueue playback_precache_request_queue_;
         FrameRequestQueue background_precache_request_queue_;

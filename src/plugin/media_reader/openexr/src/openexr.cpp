@@ -25,6 +25,7 @@
 #include "xstudio/utility/helpers.hpp"
 #include "xstudio/utility/logging.hpp"
 #include <chrono>
+#include <thread>
 #include "xstudio/ui/opengl/shader_program_base.hpp"
 
 #include "openexr.hpp"
@@ -182,7 +183,13 @@ static ui::viewport::GPUShaderPtr
 
 OpenEXRMediaReader::OpenEXRMediaReader(const utility::JsonStore &prefs)
     : MediaReader("OpenEXR", prefs) {
-    Imf::setGlobalThreadCount(16);
+    // With multiple concurrent precache workers reading EXR files in parallel,
+    // we reduce the per-read internal thread count to avoid over-subscription.
+    // Total threads = setGlobalThreadCount * concurrent_readers.
+    // Aim: ~hardware_concurrency total decode threads across all readers.
+    const unsigned int hw_threads = std::thread::hardware_concurrency();
+    const int exr_threads = std::max(2u, hw_threads / 4);
+    Imf::setGlobalThreadCount(exr_threads);
     max_exr_overscan_percent_ = 5.0f;
     readers_per_source_       = 1;
 

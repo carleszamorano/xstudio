@@ -48,6 +48,30 @@
 				"datatype": "int",
 				"context": ["APPLICATION"]
 			},
+			"max_in_flight_per_playhead": {
+				"path": "/core/media_reader/max_in_flight_per_playhead",
+				"default_value": 4,
+				"description": "Maximum number of concurrent precache read requests per playhead. Higher values improve EXR sequence read-ahead throughput by allowing parallel IO and decode, similar to OpenRV/mrv2. Set to 1 for legacy sequential behavior.",
+				"value": 4,
+				"minimum": 1,
+				"maximum": 16,
+				"datatype": "int",
+				"context": ["APPLICATION"],
+				"category": "Playback",
+				"display_name": "Precache concurrency per playhead"
+			},
+			"precache_workers_per_source": {
+				"path": "/core/media_reader/precache_workers_per_source",
+				"default_value": 4,
+				"description": "Number of parallel precache decode workers per media source. Each worker can decode a different frame simultaneously, improving throughput for image sequences (EXR, etc).",
+				"value": 4,
+				"minimum": 1,
+				"maximum": 16,
+				"datatype": "int",
+				"context": ["APPLICATION"],
+				"category": "Playback",
+				"display_name": "Precache workers per source"
+			},
 			"auto_gather_sources": {
 				"path": "/core/media_reader/auto_gather_sources",
 				"default_value": false,

@@ -41,7 +41,8 @@ class ReaderHelper : public caf::event_based_actor {
     ReaderHelper(
         caf::actor_config &cfg,
         std::vector<caf::actor> plugins,
-        std::map<std::string, utility::Uuid> plugin_map);
+        std::map<std::string, utility::Uuid> plugin_map,
+        int num_precache_workers = 4);
     ~ReaderHelper() override = default;
 
     const char *name() const override { return NAME.c_str(); }
@@ -54,15 +55,18 @@ class ReaderHelper : public caf::event_based_actor {
     caf::behavior behavior_;
     std::vector<caf::actor> plugins_;
     std::map<std::string, utility::Uuid> plugin_map_;
+    int num_precache_workers_;
 };
 
 ReaderHelper::ReaderHelper(
     caf::actor_config &cfg,
     std::vector<caf::actor> plugins,
-    std::map<std::string, utility::Uuid> plugin_map)
+    std::map<std::string, utility::Uuid> plugin_map,
+    int num_precache_workers)
     : caf::event_based_actor(cfg),
       plugins_(std::move(plugins)),
-      plugin_map_(std::move(plugin_map)) {
+      plugin_map_(std::move(plugin_map)),
+      num_precache_workers_(num_precache_workers) {
 
     behavior_.assign(
         [=](xstudio::broadcast::broadcast_down_atom, const caf::actor_addr &) {},
@@ -79,7 +83,8 @@ ReaderHelper::ReaderHelper(
                     return spawn<CachingMediaReaderActor>(
                         uuid,
                         system().registry().template get<caf::actor>(image_cache_registry),
-                        system().registry().template get<caf::actor>(audio_cache_registry));
+                        system().registry().template get<caf::actor>(audio_cache_registry),
+                        num_precache_workers_);
                 } catch (...) {
                     // shutting down
                     return make_error(sec::runtime_error, "Shutting down");
@@ -120,7 +125,8 @@ ReaderHelper::ReaderHelper(
                                             system().registry().template get<caf::actor>(
                                                 image_cache_registry),
                                             system().registry().template get<caf::actor>(
-                                                audio_cache_registry)));
+                                                audio_cache_registry),
+                                            num_precache_workers_));
                                 } catch (...) {
                                     // shutting down
                                     return rp.deliver(
@@ -142,7 +148,8 @@ ReaderHelper::ReaderHelper(
 
 GlobalMediaReaderActor::GlobalMediaReaderActor(
     caf::actor_config &cfg, const utility::Uuid &uuid)
-    : caf::event_based_actor(cfg), uuid_(uuid), max_source_count_(256), max_source_age_(600) {
+    : caf::event_based_actor(cfg), uuid_(uuid), max_source_count_(256), max_source_age_(600),
+      max_in_flight_per_playhead_(4), num_precache_workers_(4) {
     print_on_exit(this, "GlobalMediaReaderActor");
     spdlog::debug("Created GlobalMediaReaderActor.");
     if (uuid_.is_null())
@@ -157,6 +164,14 @@ GlobalMediaReaderActor::GlobalMediaReaderActor(
             max_source_count_ =
                 preference_value<size_t>(js, "/core/media_reader/max_source_count");
             max_source_age_ = preference_value<size_t>(js, "/core/media_reader/max_source_age");
+            try {
+                max_in_flight_per_playhead_ = preference_value<int>(
+                    js, "/core/media_reader/max_in_flight_per_playhead");
+            } catch (...) {}
+            try {
+                num_precache_workers_ = preference_value<int>(
+                    js, "/core/media_reader/precache_workers_per_source");
+            } catch (...) {}
         } catch (...) {
         }
 
@@ -185,7 +200,7 @@ GlobalMediaReaderActor::GlobalMediaReaderActor(
     pool_ = caf::actor_pool::make(
         system(),
         5,
-        [&] { return system().spawn<ReaderHelper>(plugins_, plugins_map_); },
+        [&] { return system().spawn<ReaderHelper>(plugins_, plugins_map_, num_precache_workers_); },
         caf::actor_pool::round_robin());
     link_to(pool_);
 
@@ -545,6 +560,14 @@ GlobalMediaReaderActor::GlobalMediaReaderActor(
                 preference_value<size_t>(json, "/core/media_reader/max_source_count");
             max_source_age_ =
                 preference_value<size_t>(json, "/core/media_reader/max_source_age");
+            try {
+                max_in_flight_per_playhead_ = preference_value<int>(
+                    json, "/core/media_reader/max_in_flight_per_playhead");
+            } catch (...) {}
+            try {
+                num_precache_workers_ = preference_value<int>(
+                    json, "/core/media_reader/precache_workers_per_source");
+            } catch (...) {}
             // mmm_->update_preferences(json);
             prune_readers();
         },
@@ -788,21 +811,18 @@ void GlobalMediaReaderActor::on_exit() { system().registry().erase(media_reader_
 
 void GlobalMediaReaderActor::do_precache() {
 
-    // We won't process a new request if there are already precache requests in
-    // flight for a given playhead. The reason is the async nature of CAF ...
-    // we could send 100s of requests to precache frames (sending messages is
-    // fast) before frames can actually be read, decoded and cached (because
-    // reading frames is slow) - we would then be in a situation where the CAF
-    // mailbox is full of requests to precache frames
+    // Allow up to max_in_flight_per_playhead_ concurrent precache requests per
+    // playhead. This fills the read pipeline so multiple frames can be decoded
+    // in parallel across the precache worker pool (similar to OpenRV/mrv2).
     std::optional<FrameRequest> fr = playback_precache_request_queue_.pop_request(
-        playheads_with_precache_requests_in_flight_);
+        playheads_with_precache_requests_in_flight_, max_in_flight_per_playhead_);
 
     // when putting new images in the cache, images older than this timepoint can
     // be discarded
     bool is_background_cache = false;
     if (not fr) {
         fr = background_precache_request_queue_.pop_request(
-            playheads_with_precache_requests_in_flight_);
+            playheads_with_precache_requests_in_flight_, max_in_flight_per_playhead_);
 
 
         if (not fr) {
@@ -824,14 +844,6 @@ void GlobalMediaReaderActor::do_precache() {
             background_cached_ref_timepoint_[playhead_uuid] - std::chrono::seconds(1);
     }
 
-    // mark that the playhead is waiting for something. This prevents queuing multiple requests,
-    // we only want to send a new request when we've received the previous one.
-
-
-    // this flag prevents us from making pre-cache read requests while other
-    // requests haven't yet been responded to, without needing to use 'await'
-    // which would otherwise block this crucial actor
-
     caf::actor cache_actor =
         mptr->media_type() == media::MediaType::MT_IMAGE ? image_cache_ : audio_cache_;
     mark_playhead_waiting_for_precache_result(playhead_uuid);
@@ -844,9 +856,6 @@ void GlobalMediaReaderActor::do_precache() {
                 if (exists) {
                     // already have in the cache, but might still have work to do
                     mark_playhead_received_precache_result(playhead_uuid);
-                    // if (is_background_cache) {
-                    // keep_cache_hot(mptr.key(), predicted_time, playhead_uuid);
-                    // }
                     continue_precacheing();
                 } else {
                     try {
@@ -903,10 +912,8 @@ void GlobalMediaReaderActor::do_precache() {
                         // image isn't in the cache, and at that point error message
                         // propagation will give the user feedback about the frame
                         // being unreadable
-
-                        // shouldn't it continue... ?
-                        // mark_playhead_received_precache_result(playhead_uuid);
-                        // continue_precacheing();
+                        mark_playhead_received_precache_result(playhead_uuid);
+                        continue_precacheing();
                     }
                 }
             },
@@ -915,6 +922,12 @@ void GlobalMediaReaderActor::do_precache() {
                 spdlog::warn(
                     "Failed preserve buffer {} {}", to_string(mptr->key()), to_string(err));
             });
+
+    // Immediately try to fill more pipeline slots. This allows N concurrent
+    // in-flight reads rather than waiting for each to complete before starting
+    // the next. The next do_precache() will check in-flight counts and stop
+    // when the pipeline is full.
+    continue_precacheing();
 }
 
 void GlobalMediaReaderActor::keep_cache_hot(
