@@ -112,7 +112,7 @@ Item {
             model: control.numTicks
             Rectangle {
                 width: 1
-                height: isBigTick ? parent.height : parent.height - 4
+                height: parent ? (isBigTick ? parent.height : parent.height - 4) : 0
                 color: "white"
                 opacity: isBigTick ? 0.4 : 0.25
                 x: (tickSpacing * index)

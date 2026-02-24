@@ -40,8 +40,8 @@ Item {
         model: viewport_overlays
 
         delegate: XsHudItem {
-            width: parent.width
-            height: parent.height
+            width: parent ? parent.width : 0
+            height: parent ? parent.height : 0
         }
     }
 

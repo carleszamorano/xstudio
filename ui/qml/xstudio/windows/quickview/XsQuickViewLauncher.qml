@@ -71,12 +71,24 @@ Item {
     property var quickWinSize: Qt.size(1280,720)
     property bool quickWinPosSet: false
 
+    // Keep persistent JS references so the GC does not collect QuickView windows
+    property var __quickViewers: []
+
     function closingQuickviewWindow(position, size) {
         // when a QuickView window is closed, remember its size and position and
         // re-use for next QuickView window
         quickWinPosition = position
         quickWinSize = size
         quickWinPosSet = true
+    }
+
+    function __trackQuickViewer(win) {
+        __quickViewers.push(win)
+        win.closing.connect(function() {
+            closingQuickviewWindow(Qt.point(win.x, win.y), Qt.size(win.width, win.height))
+            var idx = __quickViewers.indexOf(win)
+            if (idx >= 0) __quickViewers.splice(idx, 1)
+        })
     }
 
     function launchQuickViewer(sources, compare_mode, in_frame, out_frame) {
@@ -98,7 +110,11 @@ Item {
         if (component.status == Component.Ready) {
             if (compare_mode == "Off" || compare_mode == "") {
                 for (var source in sources) {
-                    var quick_viewer = component.createObject(appWindow, {x: __position.x, y: __position.y, width: __size.width, height: __size.height});
+                    // createObject(null) keeps the window top-level (no OS child-window
+                    // clipping on Windows); __trackQuickViewer holds the JS reference
+                    // so the GC cannot collect the window while it is open.
+                    var quick_viewer = component.createObject(null, {x: __position.x, y: __position.y, width: __size.width, height: __size.height});
+                    __trackQuickViewer(quick_viewer)
                     quick_viewer.show()
                     quick_viewer.viewport.view.quickViewSource([sources[source]], "Off", in_frame, out_frame)
                     quick_viewer.raise()
@@ -106,7 +122,8 @@ Item {
                     quick_viewer.raise()
                 }
             } else {
-                var quick_viewer = component.createObject(appWindow, {x: __position.x, y: __position.y, width: __size.width, height: __size.height});
+                var quick_viewer = component.createObject(null, {x: __position.x, y: __position.y, width: __size.width, height: __size.height});
+                __trackQuickViewer(quick_viewer)
                 quick_viewer.show()
                 quick_viewer.viewport.view.quickViewSource(sources, compare_mode, in_frame, out_frame)
                 quick_viewer.raise()
