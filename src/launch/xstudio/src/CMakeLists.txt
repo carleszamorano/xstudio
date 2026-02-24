@@ -35,7 +35,13 @@ set(CMAKE_AUTOUIC ON)
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 
-add_executable(${PROJECT_NAME} ${SOURCES})
+if(WIN32)
+    add_executable(${PROJECT_NAME} WIN32 ${SOURCES})
+    # Console variant: same code, but with a console window for CLI use
+    add_executable(xstudio_batch ${SOURCES})
+else()
+    add_executable(${PROJECT_NAME} ${SOURCES})
+endif()
 
 configure_file(.clang-tidy .clang-tidy)
 
@@ -87,6 +93,48 @@ target_link_libraries(${PROJECT_NAME}
 
 if(WIN32)
     target_link_libraries(${PROJECT_NAME} PRIVATE dbghelp)
+
+    # --- xstudio_batch: console variant with identical libraries ---
+    default_options_local(xstudio_batch)
+    target_link_libraries(xstudio_batch
+        PRIVATE
+            xstudio::caf_utility
+            xstudio::global
+            xstudio::ui::model_data
+            xstudio::ui::opengl::viewport
+            xstudio::ui::qml::bookmark
+            xstudio::ui::qml::conform
+            xstudio::ui::qml::embedded_python
+            xstudio::ui::qml::global_store
+            xstudio::ui::qml::helper
+            xstudio::ui::qml::log
+            xstudio::ui::qml::session
+            xstudio::ui::qml::studio
+            xstudio::ui::qml::viewport
+            xstudio::ui::qt::viewport_widget
+            xstudio::ui::viewport
+            xstudio::media
+            xstudio::media_reader
+            xstudio::utility
+            fmt::fmt
+            dbghelp
+        PUBLIC
+            fmt::fmt
+            spdlog::spdlog
+            CAF::core
+            CAF::io
+            $<$<BOOL:${NVIDIA_HACK}>:GLdispatch>
+            OTIO::opentime
+            OTIO::opentimelineio
+            Qt6::Core
+            Qt6::Gui
+            Qt6::Quick
+            Qt6::OpenGLWidgets
+            Qt6::Widgets
+            Qt6::Svg
+            OpenSSL::SSL
+            ZLIB::ZLIB
+    )
 elseif(NOT APPLE)
 	target_link_libraries(${PROJECT_NAME} PUBLIC uuid)
 endif()
@@ -102,6 +150,17 @@ if(WIN32)
 	)
 
 	install(TARGETS ${PROJECT_NAME}
+        RUNTIME DESTINATION bin)
+
+	# xstudio_batch: console exe
+	set_target_properties(xstudio_batch
+		PROPERTIES
+		RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+		OUTPUT_NAME "xstudio_batch"
+		VS_DEBUGGER_ENVIRONMENT XSTUDIO_ROOT=${CMAKE_BINARY_DIR}/bin/$<$<CONFIG:Debug>:Debug>$<$<CONFIG:Release>:Release>
+		LINK_DEPENDS_NO_SHARED true
+	)
+	install(TARGETS xstudio_batch
         RUNTIME DESTINATION bin)
 
 	# install FFMPEG and all dependencies into target bin folder
