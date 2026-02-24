@@ -2,11 +2,16 @@
 #include <filesystem>
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 
 #include <Iex.h>
 #include <IexErrnoExc.h>
 #ifdef __linux__
 #include <IlmThreadMutex.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 #endif
 #include <Imath/ImathBox.h>
 #include <ImfInputFile.h>
@@ -19,6 +24,7 @@
 #include <ImfTimeCodeAttribute.h>
 #include <ImfIntAttribute.h>
 #include <ImfVecAttribute.h>
+#include <ImfIO.h>
 
 #include "xstudio/media/media_error.hpp"
 #include "xstudio/media_reader/media_reader.hpp"
@@ -48,6 +54,85 @@ namespace exr_reader {
 
 namespace {
 static Uuid s_plugin_uuid("9fd34c7e-8b35-44c7-8976-387bae1e35e0");
+
+// Memory-mapped IStream for OpenEXR - avoids file I/O syscalls during decompression.
+// This is the key technique used by tlRender (mrv2's rendering backend) for fast EXR reads.
+// The file is memory-mapped once, then OpenEXR decompresses directly from the mapped pages.
+// The OS handles prefetching/caching at the virtual memory level, which is much faster
+// than repeated read() syscalls through OpenEXR's default StdIFStream.
+#ifdef __linux__
+class MemoryMappedIStream : public Imf::IStream {
+public:
+    MemoryMappedIStream(const char *filename)
+        : Imf::IStream(filename), fd_(-1), data_(nullptr), size_(0), pos_(0) {
+        fd_ = ::open(filename, O_RDONLY);
+        if (fd_ < 0) {
+            throw Iex::IoExc(std::string("Cannot open file: ") + filename);
+        }
+        struct stat st;
+        if (::fstat(fd_, &st) != 0) {
+            ::close(fd_);
+            fd_ = -1;
+            throw Iex::IoExc(std::string("Cannot stat file: ") + filename);
+        }
+        size_ = static_cast<uint64_t>(st.st_size);
+        if (size_ == 0) {
+            ::close(fd_);
+            fd_ = -1;
+            throw Iex::IoExc(std::string("Empty file: ") + filename);
+        }
+        data_ = static_cast<const uint8_t *>(
+            ::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd_, 0));
+        if (data_ == MAP_FAILED) {
+            data_ = nullptr;
+            ::close(fd_);
+            fd_ = -1;
+            throw Iex::IoExc(std::string("Cannot mmap file: ") + filename);
+        }
+        // Advise the kernel we'll read sequentially
+        ::madvise(const_cast<uint8_t *>(data_), size_, MADV_SEQUENTIAL);
+    }
+
+    ~MemoryMappedIStream() override {
+        if (data_) {
+            ::munmap(const_cast<uint8_t *>(data_), size_);
+        }
+        if (fd_ >= 0) {
+            ::close(fd_);
+        }
+    }
+
+    bool isMemoryMapped() const override { return true; }
+
+    char *readMemoryMapped(int n) override {
+        if (pos_ + n > size_) {
+            throw Iex::IoExc("Read past end of memory-mapped file");
+        }
+        char *out = const_cast<char *>(reinterpret_cast<const char *>(data_ + pos_));
+        pos_ += n;
+        return out;
+    }
+
+    bool read(char c[], int n) override {
+        if (pos_ + n > size_) {
+            throw Iex::IoExc("Read past end of memory-mapped file");
+        }
+        std::memcpy(c, data_ + pos_, n);
+        pos_ += n;
+        return pos_ < size_;
+    }
+
+    uint64_t tellg() override { return pos_; }
+
+    void seekg(uint64_t pos) override { pos_ = pos; }
+
+private:
+    int fd_;
+    const uint8_t *data_;
+    uint64_t size_;
+    uint64_t pos_;
+};
+#endif // __linux__
 
 /* Given an image display and data window and a maximum
 overscan amount, compute the cropped data window that limits
@@ -219,7 +304,16 @@ ImageBufPtr OpenEXRMediaReader::image(const media::AVFrameID &mptr) {
 
     // DebugTimer dd(path);
 
+    // Use memory-mapped IStream on Linux for zero-copy reads.
+    // OpenEXR decompresses directly from the mmap'd pages, eliminating
+    // per-scanline read() syscalls. This is the same technique used by
+    // tlRender (mrv2's rendering backend) for high-performance EXR playback.
+#ifdef __linux__
+    MemoryMappedIStream mmap_stream(path.c_str());
+    Imf::MultiPartInputFile input(mmap_stream);
+#else
     Imf::MultiPartInputFile input(path.c_str());
+#endif
     int parts    = input.parts();
     int part_idx = -1;
     std::array<Imf::PixelType, 4> pix_type;
@@ -621,7 +715,12 @@ xstudio::media::MediaDetail OpenEXRMediaReader::detail(const caf::uri &uri) cons
     utility::Timecode tc("00:00:00:00");
     std::vector<media::StreamDetail> streams;
 
+#ifdef __linux__
+    MemoryMappedIStream mmap_stream(path.c_str());
+    Imf::MultiPartInputFile input(mmap_stream);
+#else
     Imf::MultiPartInputFile input(path.c_str());
+#endif
     double fr = 0.0;
 
     int parts = input.parts();
