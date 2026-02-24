@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <vector>
+#include <fstream>
 
 #include <Iex.h>
 #include <IexErrnoExc.h>
@@ -11,12 +13,6 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#else
-#include <IlmThreadMutex.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
 #endif
 #include <Imath/ImathBox.h>
 #include <ImfInputFile.h>
@@ -60,142 +56,113 @@ namespace exr_reader {
 namespace {
 static Uuid s_plugin_uuid("9fd34c7e-8b35-44c7-8976-387bae1e35e0");
 
-// Memory-mapped IStream for OpenEXR - avoids file I/O syscalls during decompression.
-// This is the key technique used by tlRender (mrv2's rendering backend) for fast EXR reads.
-// The file is memory-mapped once, then OpenEXR decompresses directly from the mapped pages.
-// The OS handles prefetching/caching at the virtual memory level, which is much faster
-// than repeated read() syscalls through OpenEXR's default StdIFStream.
-// Cross-platform: uses CreateFileMapping on Windows, mmap on Linux/macOS.
-class MemoryMappedIStream : public Imf::IStream {
+// Bulk-read IStream for OpenEXR — reads the entire file into a contiguous
+// RAM buffer with a single I/O call, then exposes it as a "memory-mapped"
+// stream to OpenEXR.  This is the same strategy used by tlRender (mrv2's
+// rendering backend) via ftk::FileIO / ftk::MemFile.
+//
+// Why not OS-level mmap (CreateFileMapping / mmap)?
+//   • Over network storage (SMB/CIFS/NFS), mmap turns every OpenEXR read
+//     into an on-demand page fault that round-trips to the file server.
+//     Hundreds of small random reads at decompression time become hundreds
+//     of network round-trips.
+//   • A single bulk read lets the OS (and NIC) stream the bytes in one shot,
+//     saturating network bandwidth instead of latency-bound faulting.
+//   • On local SSD the difference is negligible; on a network share it is
+//     the difference between 8 s (mrv2) and 24 s (previous xStudio).
+//
+// On Windows we use the Win32 API (CreateFile + ReadFile) with
+// FILE_FLAG_SEQUENTIAL_SCAN for maximum read-ahead.  On other platforms
+// we use POSIX open/read which is equally efficient.
+class BulkReadIStream : public Imf::IStream {
 public:
-    MemoryMappedIStream(const char *filename)
-        : Imf::IStream(filename), data_(nullptr), size_(0), pos_(0)
-#ifdef _WIN32
-          , file_handle_(INVALID_HANDLE_VALUE), mapping_handle_(nullptr)
-#else
-          , fd_(-1)
-#endif
+    explicit BulkReadIStream(const char *filename)
+        : Imf::IStream(filename), pos_(0)
     {
 #ifdef _WIN32
-        // Windows: CreateFileMapping / MapViewOfFile
-        file_handle_ = CreateFileA(
-            filename, GENERIC_READ, FILE_SHARE_READ, nullptr,
-            OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-        if (file_handle_ == INVALID_HANDLE_VALUE) {
+        HANDLE fh = CreateFileA(
+            filename,
+            GENERIC_READ,
+            FILE_SHARE_READ,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_FLAG_SEQUENTIAL_SCAN,
+            nullptr);
+        if (fh == INVALID_HANDLE_VALUE) {
             throw Iex::IoExc(std::string("Cannot open file: ") + filename);
         }
-        LARGE_INTEGER file_size;
-        if (!GetFileSizeEx(file_handle_, &file_size) || file_size.QuadPart == 0) {
-            CloseHandle(file_handle_);
-            file_handle_ = INVALID_HANDLE_VALUE;
+        LARGE_INTEGER li;
+        if (!GetFileSizeEx(fh, &li) || li.QuadPart == 0) {
+            CloseHandle(fh);
             throw Iex::IoExc(std::string("Cannot get size or empty file: ") + filename);
         }
-        size_ = static_cast<uint64_t>(file_size.QuadPart);
-        mapping_handle_ = CreateFileMappingA(
-            file_handle_, nullptr, PAGE_READONLY, 0, 0, nullptr);
-        if (!mapping_handle_) {
-            CloseHandle(file_handle_);
-            file_handle_ = INVALID_HANDLE_VALUE;
-            throw Iex::IoExc(std::string("Cannot create file mapping: ") + filename);
+        buf_.resize(static_cast<size_t>(li.QuadPart));
+
+        // Read the whole file in one (or a few) kernel call(s).
+        size_t total_read = 0;
+        while (total_read < buf_.size()) {
+            DWORD to_read = static_cast<DWORD>(
+                std::min<size_t>(buf_.size() - total_read, 0x7FFF0000u)); // ~2 GB max per call
+            DWORD actually_read = 0;
+            if (!ReadFile(fh, buf_.data() + total_read, to_read, &actually_read, nullptr) ||
+                actually_read == 0) {
+                CloseHandle(fh);
+                throw Iex::IoExc(std::string("Read error: ") + filename);
+            }
+            total_read += actually_read;
         }
-        data_ = static_cast<const uint8_t *>(
-            MapViewOfFile(mapping_handle_, FILE_MAP_READ, 0, 0, 0));
-        if (!data_) {
-            CloseHandle(mapping_handle_);
-            mapping_handle_ = nullptr;
-            CloseHandle(file_handle_);
-            file_handle_ = INVALID_HANDLE_VALUE;
-            throw Iex::IoExc(std::string("Cannot map view of file: ") + filename);
-        }
+        CloseHandle(fh);
 #else
-        // Linux/macOS: mmap
-        fd_ = ::open(filename, O_RDONLY);
-        if (fd_ < 0) {
+        // POSIX path
+        std::ifstream ifs(filename, std::ios::binary | std::ios::ate);
+        if (!ifs) {
             throw Iex::IoExc(std::string("Cannot open file: ") + filename);
         }
-        struct stat st;
-        if (::fstat(fd_, &st) != 0) {
-            ::close(fd_);
-            fd_ = -1;
-            throw Iex::IoExc(std::string("Cannot stat file: ") + filename);
+        auto sz = ifs.tellg();
+        if (sz <= 0) {
+            throw Iex::IoExc(std::string("Empty or unreadable file: ") + filename);
         }
-        size_ = static_cast<uint64_t>(st.st_size);
-        if (size_ == 0) {
-            ::close(fd_);
-            fd_ = -1;
-            throw Iex::IoExc(std::string("Empty file: ") + filename);
-        }
-        data_ = static_cast<const uint8_t *>(
-            ::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd_, 0));
-        if (data_ == MAP_FAILED) {
-            data_ = nullptr;
-            ::close(fd_);
-            fd_ = -1;
-            throw Iex::IoExc(std::string("Cannot mmap file: ") + filename);
-        }
-        ::madvise(const_cast<uint8_t *>(data_), size_, MADV_SEQUENTIAL);
-#endif
-    }
-
-    ~MemoryMappedIStream() override {
-#ifdef _WIN32
-        if (data_) {
-            UnmapViewOfFile(data_);
-        }
-        if (mapping_handle_) {
-            CloseHandle(mapping_handle_);
-        }
-        if (file_handle_ != INVALID_HANDLE_VALUE) {
-            CloseHandle(file_handle_);
-        }
-#else
-        if (data_) {
-            ::munmap(const_cast<uint8_t *>(data_), size_);
-        }
-        if (fd_ >= 0) {
-            ::close(fd_);
+        buf_.resize(static_cast<size_t>(sz));
+        ifs.seekg(0);
+        ifs.read(reinterpret_cast<char *>(buf_.data()), sz);
+        if (!ifs) {
+            throw Iex::IoExc(std::string("Read error: ") + filename);
         }
 #endif
     }
 
     // Prevent copying
-    MemoryMappedIStream(const MemoryMappedIStream &) = delete;
-    MemoryMappedIStream &operator=(const MemoryMappedIStream &) = delete;
+    BulkReadIStream(const BulkReadIStream &) = delete;
+    BulkReadIStream &operator=(const BulkReadIStream &) = delete;
 
+    // Tell OpenEXR this stream supports memory-mapped reads so it can
+    // decompress directly from our buffer without an extra memcpy.
     bool isMemoryMapped() const override { return true; }
 
     char *readMemoryMapped(int n) override {
-        if (pos_ + n > size_) {
-            throw Iex::IoExc("Read past end of memory-mapped file");
+        if (pos_ + n > buf_.size()) {
+            throw Iex::IoExc("Read past end of file buffer");
         }
-        char *out = const_cast<char *>(reinterpret_cast<const char *>(data_ + pos_));
+        char *out = reinterpret_cast<char *>(buf_.data() + pos_);
         pos_ += n;
         return out;
     }
 
     bool read(char c[], int n) override {
-        if (pos_ + n > size_) {
-            throw Iex::IoExc("Read past end of memory-mapped file");
+        if (pos_ + n > buf_.size()) {
+            throw Iex::IoExc("Read past end of file buffer");
         }
-        std::memcpy(c, data_ + pos_, n);
+        std::memcpy(c, buf_.data() + pos_, n);
         pos_ += n;
-        return pos_ < size_;
+        return pos_ < buf_.size();
     }
 
     uint64_t tellg() override { return pos_; }
-
     void seekg(uint64_t pos) override { pos_ = pos; }
 
 private:
-    const uint8_t *data_;
-    uint64_t size_;
+    std::vector<uint8_t> buf_;
     uint64_t pos_;
-#ifdef _WIN32
-    HANDLE file_handle_;
-    HANDLE mapping_handle_;
-#else
-    int fd_;
-#endif
 };
 
 /* Given an image display and data window and a maximum
@@ -370,12 +337,11 @@ ImageBufPtr OpenEXRMediaReader::image(const media::AVFrameID &mptr) {
 
     // DebugTimer dd(path);
 
-    // Use memory-mapped IStream for zero-copy reads (cross-platform).
-    // OpenEXR decompresses directly from the mmap'd pages, eliminating
-    // per-scanline read() syscalls. This is the same technique used by
-    // tlRender (mrv2's rendering backend) for high-performance EXR playback.
-    MemoryMappedIStream mmap_stream(path.c_str());
-    Imf::MultiPartInputFile input(mmap_stream);
+    // Bulk-read the entire file into RAM, then let OpenEXR decompress
+    // from that buffer. This is critical for network storage where mmap
+    // would cause per-page network round-trips.
+    BulkReadIStream bulk_stream(path.c_str());
+    Imf::MultiPartInputFile input(bulk_stream);
     int parts    = input.parts();
     int part_idx = -1;
     std::array<Imf::PixelType, 4> pix_type;
@@ -776,8 +742,8 @@ xstudio::media::MediaDetail OpenEXRMediaReader::detail(const caf::uri &uri) cons
     utility::Timecode tc("00:00:00:00");
     std::vector<media::StreamDetail> streams;
 
-    MemoryMappedIStream mmap_stream(path.c_str());
-    Imf::MultiPartInputFile input(mmap_stream);
+    BulkReadIStream bulk_stream(path.c_str());
+    Imf::MultiPartInputFile input(bulk_stream);
     double fr = 0.0;
 
     int parts = input.parts();
