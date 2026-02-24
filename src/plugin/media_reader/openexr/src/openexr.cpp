@@ -395,11 +395,13 @@ ImageBufPtr OpenEXRMediaReader::image(const media::AVFrameID &mptr) {
 
     Imf::InputPart in(input, part_idx);
 
-    // Skip expensive metadata JSON conversion during image reads.
-    // dump_json_headers() does 20+ dynamic_casts per attribute across ~30 attributes,
-    // wasting CPU on RTTI. The detail() function already captures full metadata when
-    // a source is first opened, making this redundant for playback. The media_metadata
-    // plugin provides per-source metadata to the inspector/HUD separately.
+    utility::JsonStore part_metadata;
+    try {
+        const Imf::Header &h = in.header();
+        exr_reader::dump_json_headers(h, part_metadata.ref());
+    } catch (const std::exception &e) {
+        part_metadata["METADATA LOAD ERROR"] = e.what();
+    }
 
     Imath::Box2i data_window    = in.header().dataWindow();
     Imath::Box2i display_window = in.header().displayWindow();
@@ -452,8 +454,7 @@ ImageBufPtr OpenEXRMediaReader::image(const media::AVFrameID &mptr) {
         memset(b, 0, buf_size);
     }
 
-    // Metadata is NOT set per-frame for performance. See detail() and the
-    // media_metadata OpenEXR plugin for metadata capture on source load.
+    buf->set_metadata(part_metadata);
 
     // 4th channel is always put into 'alpha' channel as per shader code
     // above
