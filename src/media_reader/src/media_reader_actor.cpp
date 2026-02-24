@@ -41,7 +41,8 @@ class ReaderHelper : public caf::event_based_actor {
     ReaderHelper(
         caf::actor_config &cfg,
         std::vector<caf::actor> plugins,
-        std::map<std::string, utility::Uuid> plugin_map);
+        std::map<std::string, utility::Uuid> plugin_map,
+        int num_precache_workers);
     ~ReaderHelper() override = default;
 
     const char *name() const override { return NAME.c_str(); }
@@ -54,15 +55,18 @@ class ReaderHelper : public caf::event_based_actor {
     caf::behavior behavior_;
     std::vector<caf::actor> plugins_;
     std::map<std::string, utility::Uuid> plugin_map_;
+    int num_precache_workers_;
 };
 
 ReaderHelper::ReaderHelper(
     caf::actor_config &cfg,
     std::vector<caf::actor> plugins,
-    std::map<std::string, utility::Uuid> plugin_map)
+    std::map<std::string, utility::Uuid> plugin_map,
+    int num_precache_workers)
     : caf::event_based_actor(cfg),
       plugins_(std::move(plugins)),
-      plugin_map_(std::move(plugin_map)) {
+      plugin_map_(std::move(plugin_map)),
+      num_precache_workers_(num_precache_workers) {
 
     behavior_.assign(
         [=](xstudio::broadcast::broadcast_down_atom, const caf::actor_addr &) {},
@@ -79,7 +83,8 @@ ReaderHelper::ReaderHelper(
                     return spawn<CachingMediaReaderActor>(
                         uuid,
                         system().registry().template get<caf::actor>(image_cache_registry),
-                        system().registry().template get<caf::actor>(audio_cache_registry));
+                        system().registry().template get<caf::actor>(audio_cache_registry),
+                        num_precache_workers_);
                 } catch (...) {
                     // shutting down
                     return make_error(sec::runtime_error, "Shutting down");
@@ -120,7 +125,8 @@ ReaderHelper::ReaderHelper(
                                             system().registry().template get<caf::actor>(
                                                 image_cache_registry),
                                             system().registry().template get<caf::actor>(
-                                                audio_cache_registry)));
+                                                audio_cache_registry),
+                                            num_precache_workers_));
                                 } catch (...) {
                                     // shutting down
                                     return rp.deliver(
@@ -157,6 +163,14 @@ GlobalMediaReaderActor::GlobalMediaReaderActor(
             max_source_count_ =
                 preference_value<size_t>(js, "/core/media_reader/max_source_count");
             max_source_age_ = preference_value<size_t>(js, "/core/media_reader/max_source_age");
+            try {
+                num_precache_workers_ =
+                    preference_value<int>(js, "/core/media_reader/precache_workers_per_source");
+            } catch (...) {}
+            try {
+                max_in_flight_per_playhead_ =
+                    preference_value<int>(js, "/core/media_reader/max_in_flight_per_playhead");
+            } catch (...) {}
         } catch (...) {
         }
 
@@ -185,7 +199,7 @@ GlobalMediaReaderActor::GlobalMediaReaderActor(
     pool_ = caf::actor_pool::make(
         system(),
         5,
-        [&] { return system().spawn<ReaderHelper>(plugins_, plugins_map_); },
+        [&] { return system().spawn<ReaderHelper>(plugins_, plugins_map_, num_precache_workers_); },
         caf::actor_pool::round_robin());
     link_to(pool_);
 
@@ -545,6 +559,14 @@ GlobalMediaReaderActor::GlobalMediaReaderActor(
                 preference_value<size_t>(json, "/core/media_reader/max_source_count");
             max_source_age_ =
                 preference_value<size_t>(json, "/core/media_reader/max_source_age");
+            try {
+                num_precache_workers_ =
+                    preference_value<int>(json, "/core/media_reader/precache_workers_per_source");
+            } catch (...) {}
+            try {
+                max_in_flight_per_playhead_ =
+                    preference_value<int>(json, "/core/media_reader/max_in_flight_per_playhead");
+            } catch (...) {}
             // mmm_->update_preferences(json);
             prune_readers();
         },
@@ -795,14 +817,14 @@ void GlobalMediaReaderActor::do_precache() {
     // reading frames is slow) - we would then be in a situation where the CAF
     // mailbox is full of requests to precache frames
     std::optional<FrameRequest> fr = playback_precache_request_queue_.pop_request(
-        playheads_with_precache_requests_in_flight_);
+        playheads_with_precache_requests_in_flight_, max_in_flight_per_playhead_);
 
     // when putting new images in the cache, images older than this timepoint can
     // be discarded
     bool is_background_cache = false;
     if (not fr) {
         fr = background_precache_request_queue_.pop_request(
-            playheads_with_precache_requests_in_flight_);
+            playheads_with_precache_requests_in_flight_, max_in_flight_per_playhead_);
 
 
         if (not fr) {

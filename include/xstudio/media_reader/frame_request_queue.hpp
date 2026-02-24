@@ -87,7 +87,7 @@ namespace media_reader {
          *
          */
         std::optional<FrameRequest>
-        pop_request(const std::map<utility::Uuid, int> &exclude_playheads);
+        pop_request(const std::map<utility::Uuid, int> &in_flight_counts, int max_in_flight = 1);
 
         /**
          *   @brief Add a request to the queue

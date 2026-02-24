@@ -55,6 +55,26 @@
 				"value": true,
 				"datatype": "bool",
 				"context": ["APPLICATION"]
+			},
+			"precache_workers_per_source": {
+				"path": "/core/media_reader/precache_workers_per_source",
+				"default_value": 4,
+				"description": "Number of parallel precache reader workers per media source.",
+				"value": 4,
+				"minimum": 1,
+				"maximum": 32,
+				"datatype": "int",
+				"context": ["APPLICATION"]
+			},
+			"max_in_flight_per_playhead": {
+				"path": "/core/media_reader/max_in_flight_per_playhead",
+				"default_value": 16,
+				"description": "Maximum number of concurrent precache read requests in flight per playhead.",
+				"value": 16,
+				"minimum": 1,
+				"maximum": 64,
+				"datatype": "int",
+				"context": ["APPLICATION"]
 			}
 		}
 	}

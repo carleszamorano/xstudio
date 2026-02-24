@@ -2,6 +2,15 @@
 #include <filesystem>
 #include <algorithm>
 #include <cctype>
+#include <cstring>
+#include <vector>
+#include <fstream>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/stat.h>
+#endif
 
 #include <Iex.h>
 #include <IexErrnoExc.h>
@@ -9,6 +18,7 @@
 #include <IlmThreadMutex.h>
 #endif
 #include <Imath/ImathBox.h>
+#include <ImfIO.h>
 #include <ImfInputFile.h>
 #include <ImfInputPart.h>
 #include <ImfMultiPartInputFile.h>
@@ -44,6 +54,89 @@ namespace exr_reader {
     bool dump_json_headers(const Imf::Header &h, nlohmann::json &root);
 }
 } // namespace xstudio
+
+// ---------------------------------------------------------------------------
+// BulkReadIStream: reads entire file into RAM in one I/O call then exposes it
+// as a memory-mapped Imf::IStream.  Avoids per-scanline read() syscalls and,
+// critically, eliminates page-fault storms when reading from network storage.
+// ---------------------------------------------------------------------------
+class BulkReadIStream : public Imf::IStream {
+  public:
+    explicit BulkReadIStream(const char *path)
+        : Imf::IStream(path), pos_(0) {
+#ifdef _WIN32
+        HANDLE hFile = CreateFileA(
+            path,
+            GENERIC_READ,
+            FILE_SHARE_READ,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_FLAG_SEQUENTIAL_SCAN,
+            nullptr);
+        if (hFile == INVALID_HANDLE_VALUE)
+            throw Iex::IoExc(std::string("BulkReadIStream: cannot open ") + path);
+
+        LARGE_INTEGER sz;
+        if (!GetFileSizeEx(hFile, &sz)) {
+            CloseHandle(hFile);
+            throw Iex::IoExc(std::string("BulkReadIStream: cannot get size ") + path);
+        }
+        data_.resize(static_cast<size_t>(sz.QuadPart));
+
+        size_t total = 0;
+        while (total < data_.size()) {
+            DWORD to_read = static_cast<DWORD>(
+                std::min<size_t>(data_.size() - total, 64u * 1024u * 1024u));
+            DWORD got = 0;
+            if (!ReadFile(hFile, data_.data() + total, to_read, &got, nullptr) || got == 0) {
+                CloseHandle(hFile);
+                throw Iex::IoExc(std::string("BulkReadIStream: read error ") + path);
+            }
+            total += got;
+        }
+        CloseHandle(hFile);
+#else
+        struct stat st;
+        if (stat(path, &st) != 0)
+            throw Iex::IoExc(std::string("BulkReadIStream: cannot stat ") + path);
+        data_.resize(static_cast<size_t>(st.st_size));
+
+        std::ifstream ifs(path, std::ios::binary);
+        if (!ifs)
+            throw Iex::IoExc(std::string("BulkReadIStream: cannot open ") + path);
+        ifs.read(reinterpret_cast<char *>(data_.data()),
+                 static_cast<std::streamsize>(data_.size()));
+        if (!ifs)
+            throw Iex::IoExc(std::string("BulkReadIStream: read error ") + path);
+#endif
+    }
+
+    bool isMemoryMapped() const override { return true; }
+
+    bool read(char c[], int n) override {
+        if (pos_ + n > data_.size())
+            throw Iex::IoExc("BulkReadIStream: read past end");
+        std::memcpy(c, data_.data() + pos_, n);
+        pos_ += n;
+        return pos_ < data_.size();
+    }
+
+    char *readMemoryMapped(int n) override {
+        if (pos_ + n > data_.size())
+            throw Iex::IoExc("BulkReadIStream: readMemoryMapped past end");
+        char *ptr = reinterpret_cast<char *>(data_.data() + pos_);
+        pos_ += n;
+        return ptr;
+    }
+
+    uint64_t tellg() override { return pos_; }
+
+    void seekg(uint64_t pos) override { pos_ = static_cast<size_t>(pos); }
+
+  private:
+    std::vector<uint8_t> data_;
+    size_t pos_;
+};
 
 namespace {
 static Uuid s_plugin_uuid("9fd34c7e-8b35-44c7-8976-387bae1e35e0");
@@ -212,7 +305,8 @@ ImageBufPtr OpenEXRMediaReader::image(const media::AVFrameID &mptr) {
 
     // DebugTimer dd(path);
 
-    Imf::MultiPartInputFile input(path.c_str());
+    BulkReadIStream bis(path.c_str());
+    Imf::MultiPartInputFile input(bis);
     int parts    = input.parts();
     int part_idx = -1;
     std::array<Imf::PixelType, 4> pix_type;
@@ -614,7 +708,8 @@ xstudio::media::MediaDetail OpenEXRMediaReader::detail(const caf::uri &uri) cons
     utility::Timecode tc("00:00:00:00");
     std::vector<media::StreamDetail> streams;
 
-    Imf::MultiPartInputFile input(path.c_str());
+    BulkReadIStream bis(path.c_str());
+    Imf::MultiPartInputFile input(bis);
     double fr = 0.0;
 
     int parts = input.parts();
