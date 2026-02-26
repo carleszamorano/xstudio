@@ -190,7 +190,7 @@ if (USE_VCPKG)
   set(VCPKG_INTEGRATION ON)
 
   # Install pip and sphinx
-  find_package(Python COMPONENTS Interpreter Development)
+  find_package(Python 3.11.10 REQUIRED COMPONENTS Interpreter Development)
 
   message("Python_RUNTIME_LIBRARY_DIRS ${Python_RUNTIME_LIBRARY_DIRS}")
 

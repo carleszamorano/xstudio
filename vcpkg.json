@@ -9,7 +9,10 @@
     "freetype",
     "libjpeg-turbo",
     "pybind11",
-    "python3",
+    {
+      "name": "python3",
+      "version>=": "3.11.10"
+    },
     "spdlog",
     "fmt",
     "lcms",
